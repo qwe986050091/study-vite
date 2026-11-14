@@ -1,0 +1,2208 @@
+/*
+ * 文件角色（本文件 = 生产构建的「归一化 + 编排」层，打包器本身在 rolldown）：
+ * - 上游：cli.ts 的 build 命令调用 createBuilder() + builder.buildApp()；编程式 API 的 build() 也走同一条路。
+ * - 本文件把 ResolvedConfig 翻译成一份 RolldownOptions，最后调用 rolldown(rolldownOptions) 真正打包。
+ *   内核是 rolldown（Rust），不是 rollup；这里出现的 Rollup* 只是插件接口的兼容类型。
+ * - Vite 在这一层之上补的能力：rolldownOptions/rollupOptions 合并兼容、插件序列（resolveBuildPlugins 的 pre/post）、
+ *   从 index.html 推导 input、outDir/emptyOutDir、manifest/ssrManifest、watch、minify(oxc/terser/esbuild)、
+ *   cssCodeSplit 与资源收集、chunk 元数据（viteMetadata），以及 Builder 多环境构建。
+ * - 关键不变量：每个 environment（client/ssr/worker）各自一份 rolldown 构建；legacy builder 只建一个环境，
+ *   多环境 builder 会为每个 environment 重新 resolveConfig（插件实例也重造）。
+ * - 易误解点 1：rolldownOptions.output 只是用户覆盖项，最终会被 buildOutputOptions() 补齐 dir/format/
+ *   entryFileNames/chunkFileNames/assetFileNames/minify/comments；写 output.file 会被直接拒绝。
+ * - 易误解点 2：esbuild 相关分支只在用户显式配置时生效（build.minify === 'esbuild'，或 esbuild.banner/footer），
+ *   默认转译链是 oxc；这里保留它们是为了向后兼容，不是主路径。
+ */
+import path from 'node:path'
+import colors from 'picocolors'
+import type {
+  ExternalOption,
+  InputOption,
+  InternalModuleFormat,
+  LogLevel,
+  LogOrStringHandler,
+  MinimalPluginContext,
+  ModuleFormat,
+  OutputAsset,
+  OutputBundle,
+  OutputChunk,
+  OutputOptions,
+  PluginContext,
+  RenderedChunk,
+  RolldownBuild,
+  RolldownOptions,
+  RolldownOutput,
+  RolldownWatcher,
+  RollupError,
+  RollupLog,
+  WarningHandlerWithDefault,
+  WatcherOptions,
+} from 'rolldown'
+import { viteLoadFallbackPlugin as nativeLoadFallbackPlugin } from 'rolldown/experimental'
+import type { RollupCommonJSOptions } from '#dep-types/commonjs'
+import type { RollupDynamicImportVarsOptions } from '#dep-types/dynamicImportVars'
+import type { EsbuildTarget } from '#types/internal/esbuildOptions'
+import type { AssetMetadata, ChunkMetadata } from '#types/metadata'
+import { joinUrlSegments } from '../shared/utils'
+import type { PartialEnvironment } from './baseEnvironment'
+import { BaseEnvironment } from './baseEnvironment'
+import type {
+  EnvironmentOptions,
+  InlineConfig,
+  ResolvedConfig,
+  ResolvedEnvironmentOptions,
+} from './config'
+import { resolveConfig } from './config'
+import {
+  DEFAULT_ASSETS_INLINE_LIMIT,
+  ESBUILD_BASELINE_WIDELY_AVAILABLE_TARGET,
+  ROLLUP_HOOKS,
+  VERSION,
+  CSS_LANGS_RE,
+} from './constants'
+import {
+  isFutureDeprecationEnabled,
+  warnFutureDeprecation,
+} from './deprecations'
+import type { Environment } from './environment'
+import { type Logger } from './logger'
+import { findNearestMainPackageData, findNearestPackageData } from './packages'
+import type { PackageCache } from './packages'
+import { perEnvironmentPlugin } from './plugin'
+import type { MinimalPluginContextWithoutEnvironment, Plugin } from './plugin'
+import { getHookHandler } from './plugins'
+import { buildEsbuildPlugin } from './plugins/esbuild'
+import { buildImportAnalysisPlugin } from './plugins/importAnalysisBuild'
+import { type LicenseOptions, licensePlugin } from './plugins/license'
+import { type Manifest, manifestPlugin } from './plugins/manifest'
+import { prepareOutDirPlugin } from './plugins/prepareOutDir'
+import { buildReporterPlugin } from './plugins/reporter'
+import { type TerserOptions, terserPlugin } from './plugins/terser'
+import { webWorkerPostPlugin } from './plugins/worker'
+import {
+  BasicMinimalPluginContext,
+  basePluginContextMeta,
+} from './server/pluginContainer'
+import { ssrManifestPlugin } from './ssr/ssrManifestPlugin'
+import type { RollupPluginHooks } from './typeUtils'
+import {
+  arraify,
+  asyncFlatten,
+  createDebugger,
+  displayTime,
+  getPkgName,
+  mergeConfig,
+  mergeWithDefaults,
+  partialEncodeURIPath,
+  setupRollupOptionCompat,
+  unique,
+} from './utils'
+import {
+  convertToWatcherOptions,
+  getResolvedOutDirs,
+  resolveChokidarOptions,
+  resolveEmptyOutDir,
+} from './watch'
+
+// 这是用户面（配置面）的 build 选项类型；下面大量 JSDoc 是上游文档，注释里只标出与 rolldown 迁移相关的语义变化。
+export interface BuildEnvironmentOptions {
+  /**
+   * Compatibility transform target. The transform is performed with esbuild
+   * and the lowest supported target is es2015. Note this only handles
+   * syntax transformation and does not cover polyfills
+   *
+   * Default: 'baseline-widely-available' - transpile targeting browsers that
+   * are included in the Baseline Widely Available on 2026-01-01.
+   * (Chrome 111+, Edge 111+, Firefox 114+, Safari 16.4+).
+   *
+   * Another special value is 'esnext' - which only performs minimal transpiling
+   * (for minification compat).
+   *
+   * For custom targets, see https://esbuild.github.io/api/#target and
+   * https://esbuild.github.io/content-types/#javascript for more details.
+   * @default 'baseline-widely-available'
+   */
+  target?: 'baseline-widely-available' | EsbuildTarget | false
+  /**
+   * whether to inject module preload polyfill.
+   * Note: does not apply to library mode.
+   * @default true
+   * @deprecated use `modulePreload.polyfill` instead
+   */
+  polyfillModulePreload?: boolean
+  /**
+   * Configure module preload
+   * Note: does not apply to library mode.
+   * @default true
+   */
+  modulePreload?: boolean | ModulePreloadOptions
+  /**
+   * Directory relative from `root` where build output will be placed. If the
+   * directory exists, it will be removed before the build.
+   * @default 'dist'
+   */
+  outDir?: string
+  /**
+   * Directory relative from `outDir` where the built js/css/image assets will
+   * be placed.
+   * @default 'assets'
+   */
+  assetsDir?: string
+  /**
+   * Static asset files smaller than this number (in bytes) will be inlined as
+   * base64 strings. If a callback is passed, a boolean can be returned to opt-in
+   * or opt-out of inlining. If nothing is returned the default logic applies.
+   *
+   * Default limit is `4096` (4 KiB). Set to `0` to disable.
+   * @default 4096
+   */
+  assetsInlineLimit?:
+    | number
+    | ((filePath: string, content: Buffer) => boolean | undefined)
+  /**
+   * Whether to code-split CSS. When enabled, CSS in async chunks will be
+   * inlined as strings in the chunk and inserted via dynamically created
+   * style tags when the chunk is loaded.
+   * @default true
+   */
+  cssCodeSplit?: boolean
+  /**
+   * An optional separate target for CSS minification.
+   * As esbuild only supports configuring targets to mainstream
+   * browsers, users may need this option when they are targeting
+   * a niche browser that comes with most modern JavaScript features
+   * but has poor CSS support, e.g. Android WeChat WebView, which
+   * doesn't support the #RGBA syntax.
+   * When `build.cssMinify` is `lightningcss` (the default), this
+   * option takes precedence over `css.lightningcss.targets` for the
+   * minification step.
+   * @default target
+   */
+  cssTarget?: EsbuildTarget | false
+  /**
+   * Override CSS minification specifically instead of defaulting to `build.minify`,
+   * so you can configure minification for JS and CSS separately.
+   * @default 'lightningcss', but false if build.minify is disabled for client build
+   */
+  cssMinify?: boolean | 'lightningcss' | 'esbuild'
+  /**
+   * If `true`, a separate sourcemap file will be created. If 'inline', the
+   * sourcemap will be appended to the resulting output file as data URI.
+   * 'hidden' works like `true` except that the corresponding sourcemap
+   * comments in the bundled files are suppressed.
+   * @default false
+   */
+  sourcemap?: boolean | 'inline' | 'hidden'
+  /**
+   * Set to `false` to disable minification, or specify the minifier to use.
+   * Available options are 'oxc' or 'terser' or 'esbuild'.
+   * @default 'oxc' for client build, false for SSR build
+   */
+  minify?: boolean | 'oxc' | 'terser' | 'esbuild'
+  /**
+   * Options for terser
+   * https://terser.org/docs/api-reference#minify-options
+   *
+   * In addition, you can also pass a `maxWorkers: number` option to specify the
+   * max number of workers to spawn. Defaults to the number of CPUs minus 1.
+   */
+  terserOptions?: TerserOptions
+  /**
+   * Whether to use import maps feature to optimize chunk caching efficiency.
+   * @default false
+   * @experimental
+   */
+  chunkImportMap?: boolean
+  /**
+   * Alias to `rolldownOptions`
+   * @deprecated Use `rolldownOptions` instead.
+   */
+  rollupOptions?: RolldownOptions
+  /**
+   * Will be merged with internal rolldown options.
+   * https://rolldown.rs/reference/Interface.RolldownOptions
+   */
+  rolldownOptions?: RolldownOptions
+  /**
+   * Options to pass on to `@rollup/plugin-commonjs`
+   * @deprecated This option is no-op and will be removed in future versions.
+   */
+  commonjsOptions?: RollupCommonJSOptions
+  /**
+   * Options to pass on to `@rollup/plugin-dynamic-import-vars`
+   */
+  dynamicImportVarsOptions?: RollupDynamicImportVarsOptions
+  /**
+   * Whether to write bundle to disk
+   * @default true
+   */
+  write?: boolean
+  /**
+   * Empty outDir on write.
+   * @default true when outDir is a sub directory of project root
+   */
+  emptyOutDir?: boolean | null
+  /**
+   * Copy the public directory to outDir on write.
+   * @default true
+   */
+  copyPublicDir?: boolean
+  /**
+   * Whether to emit a `.vite/license.md` file that includes all bundled dependencies'
+   * licenses. Pass an object to customize the output file name.
+   * @default false
+   */
+  license?: boolean | LicenseOptions
+  /**
+   * Whether to emit a .vite/manifest.json in the output dir to map hash-less filenames
+   * to their hashed versions. Useful when you want to generate your own HTML
+   * instead of using the one generated by Vite.
+   *
+   * Example:
+   *
+   * ```json
+   * {
+   *   "main.js": {
+   *     "file": "main.68fe3fad.js",
+   *     "css": "main.e6b63442.css",
+   *     "imports": [...],
+   *     "dynamicImports": [...]
+   *   }
+   * }
+   * ```
+   * @default false
+   */
+  manifest?: boolean | string
+  /**
+   * Build in library mode. The value should be the global name of the lib in
+   * UMD mode. This will produce esm + cjs + umd bundle formats with default
+   * configurations that are suitable for distributing libraries.
+   * @default false
+   */
+  lib?: LibraryOptions | false
+  /**
+   * Produce SSR oriented build. Note this requires specifying SSR entry via
+   * `rolldownOptions.input`.
+   * @default false
+   */
+  ssr?: boolean | string
+  /**
+   * Generate SSR manifest for determining style links and asset preload
+   * directives in production.
+   * @default false
+   */
+  ssrManifest?: boolean | string
+  /**
+   * Emit assets during SSR.
+   * @default false
+   */
+  ssrEmitAssets?: boolean
+  /**
+   * Emit assets during build. Frameworks can set environments.ssr.build.emitAssets
+   * By default, it is true for the client and false for other environments.
+   */
+  emitAssets?: boolean
+  /**
+   * Set to false to disable reporting compressed chunk sizes.
+   * Can slightly improve build speed.
+   * @default true
+   */
+  reportCompressedSize?: boolean
+  /**
+   * Adjust chunk size warning limit (in kB).
+   * @default 500
+   */
+  chunkSizeWarningLimit?: number
+  /**
+   * Rollup watch options
+   * https://rollupjs.org/configuration-options/#watch
+   * @default null
+   */
+  watch?: WatcherOptions | null
+  /**
+   * create the Build Environment instance
+   */
+  createEnvironment?: (
+    name: string,
+    config: ResolvedConfig,
+  ) => Promise<BuildEnvironment> | BuildEnvironment
+}
+
+export type BuildOptions = BuildEnvironmentOptions
+
+export interface LibraryOptions {
+  /**
+   * Path of library entry.
+   * Defaults to the top-level `input` option when omitted.
+   */
+  entry?: InputOption
+  /**
+   * The name of the exposed global variable. Required when the `formats` option includes
+   * `umd` or `iife`
+   */
+  name?: string
+  /**
+   * Output bundle formats. Defaults to `['es', 'umd']` for a single entry, or
+   * `['es', 'cjs']` for multiple entries (`umd` and `iife` do not support
+   * multiple entries).
+   * @default ['es', 'umd']
+   */
+  formats?: LibraryFormats[]
+  /**
+   * The name of the package file output. The default file name is the name option
+   * of the project package.json. It can also be defined as a function taking the
+   * format as an argument.
+   */
+  fileName?: string | ((format: ModuleFormat, entryName: string) => string)
+  /**
+   * The name of the CSS file output if the library imports CSS. Defaults to the
+   * same value as `build.lib.fileName` if it's set a string, otherwise it falls
+   * back to the name option of the project package.json.
+   */
+  cssFileName?: string
+}
+
+export type LibraryFormats = 'es' | 'cjs' | 'umd' | 'iife' // | 'system'
+
+export interface ModulePreloadOptions {
+  /**
+   * Whether to inject a module preload polyfill.
+   * Note: does not apply to library mode.
+   * @default true
+   */
+  polyfill?: boolean
+  /**
+   * Resolve the list of dependencies to preload for a given dynamic import
+   * @experimental
+   */
+  resolveDependencies?: ResolveModulePreloadDependenciesFn
+}
+export interface ResolvedModulePreloadOptions {
+  polyfill: boolean
+  resolveDependencies?: ResolveModulePreloadDependenciesFn
+}
+
+export type ResolveModulePreloadDependenciesFn = (
+  filename: string,
+  deps: string[],
+  context: {
+    hostId: string
+    hostType: 'html' | 'js'
+  },
+) => string[]
+
+export interface ResolvedBuildEnvironmentOptions extends Required<
+  Omit<BuildEnvironmentOptions, 'polyfillModulePreload'>
+> {
+  modulePreload: false | ResolvedModulePreloadOptions
+}
+
+export interface ResolvedBuildOptions extends Required<
+  Omit<BuildOptions, 'polyfillModulePreload'>
+> {
+  modulePreload: false | ResolvedModulePreloadOptions
+}
+
+// 默认值表。注意 cssCodeSplit / cssTarget / cssMinify / minify / ssr / emitAssets / createEnvironment
+// 这几项依赖 consumer（client/server），不能写进冻结表，而是在 resolveBuildEnvironmentOptions 里按环境补。
+const _buildEnvironmentOptionsDefaults = Object.freeze({
+  target: 'baseline-widely-available',
+  /** @deprecated */
+  polyfillModulePreload: true,
+  modulePreload: true,
+  outDir: 'dist',
+  assetsDir: 'assets',
+  assetsInlineLimit: DEFAULT_ASSETS_INLINE_LIMIT,
+  // cssCodeSplit
+  // cssTarget
+  // cssMinify
+  sourcemap: false,
+  // minify
+  terserOptions: {},
+  chunkImportMap: false,
+  rolldownOptions: {},
+  commonjsOptions: {
+    include: [/node_modules/],
+    extensions: ['.js', '.cjs'],
+  },
+  dynamicImportVarsOptions: {
+    exclude: [/node_modules/],
+  },
+  write: true,
+  emptyOutDir: null,
+  copyPublicDir: true,
+  license: false,
+  manifest: false,
+  lib: false,
+  // ssr
+  ssrManifest: false,
+  ssrEmitAssets: false,
+  // emitAssets
+  reportCompressedSize: true,
+  chunkSizeWarningLimit: 500,
+  watch: null,
+  // createEnvironment
+} satisfies BuildEnvironmentOptions)
+export const buildEnvironmentOptionsDefaults: Readonly<
+  Partial<BuildEnvironmentOptions>
+> = _buildEnvironmentOptionsDefaults
+
+/**
+ * 作用：把用户写的 build 配置补齐成 ResolvedBuildEnvironmentOptions。
+ * 调用点：config.ts 的 resolveConfig 在解析每个 environment 时调用（本文件导出）。
+ * 关键参数：consumer 决定 minify/ssr/emitAssets/platform 的默认值；isBundledDev 表示当前是「打包式 dev」而非生产构建；
+ *   input 只在 lib 模式且未显式给 entry 时用于回填 lib.entry。
+ * 失败模式：本函数不抛；但 lib 缺 entry 且无顶层 input 时，后续 resolveRolldownOptions 会抛错。
+ */
+export function resolveBuildEnvironmentOptions(
+  raw: BuildEnvironmentOptions,
+  logger: Logger,
+  consumer: 'client' | 'server' | undefined,
+  isBundledDev: boolean,
+  input?: InputOption,
+  isSsrTargetWebworkerEnvironment?: boolean,
+): ResolvedBuildEnvironmentOptions {
+  const deprecatedPolyfillModulePreload = raw.polyfillModulePreload
+  const { polyfillModulePreload, ...rest } = raw
+  raw = rest
+  if (deprecatedPolyfillModulePreload !== undefined) {
+    logger.warn(
+      'polyfillModulePreload is deprecated. Use modulePreload.polyfill instead.',
+    )
+  }
+  if (
+    deprecatedPolyfillModulePreload === false &&
+    raw.modulePreload === undefined
+  ) {
+    raw.modulePreload = { polyfill: false }
+  }
+
+  const merged = mergeWithDefaults(
+    {
+      ..._buildEnvironmentOptionsDefaults,
+      cssCodeSplit: !raw.lib,
+      minify: consumer === 'server' || isBundledDev ? false : 'oxc',
+      rollupOptions: {},
+      rolldownOptions: undefined,
+      ssr: consumer === 'server',
+      emitAssets: consumer === 'client',
+      createEnvironment: (name, config) => new BuildEnvironment(name, config),
+    } satisfies BuildEnvironmentOptions,
+    raw,
+  )
+  setupRollupOptionCompat(merged)
+  if (isBundledDev) {
+    merged.chunkImportMap = false
+  }
+  merged.rolldownOptions = {
+    platform:
+      consumer === 'client' || isSsrTargetWebworkerEnvironment
+        ? 'browser'
+        : 'node',
+    ...merged.rolldownOptions,
+  }
+  if (merged.lib && merged.lib.entry == null && input != null) {
+    // avoid mutating the user-provided lib options object
+    merged.lib = { ...merged.lib, entry: input }
+  }
+
+  // handle special build targets
+  if (merged.target === 'baseline-widely-available') {
+    merged.target = ESBUILD_BASELINE_WIDELY_AVAILABLE_TARGET
+  }
+  // dedupe target
+  if (Array.isArray(merged.target)) {
+    // esbuild allowed duplicate targets but oxc does not
+    merged.target = unique(merged.target)
+  }
+
+  // normalize false string into actual false
+  if ((merged.minify as string) === 'false') {
+    merged.minify = false
+  } else if (merged.minify === true) {
+    merged.minify = 'oxc'
+  }
+
+  // 走到这里 merged.minify 只可能是 false | 'oxc' | 'terser' | 'esbuild'：'false' 字符串与布尔 true 都已被归一化。
+  // 保留 'esbuild' 是因为用户显式选择，由 post 阶段的 buildEsbuildPlugin 执行；默认值已经是 oxc。
+  const defaultModulePreload = {
+    polyfill: true,
+  }
+
+  // cssTarget 缺省跟随 JS target；cssMinify 缺省在 server 上固定为 lightningcss（保证 CSS 输出始终可解析），
+  // 在 client 上跟随 minify 开关（minify 为真即启用默认的 lightningcss，为 false 则关闭）。
+  const resolved: ResolvedBuildEnvironmentOptions = {
+    ...merged,
+    cssTarget: merged.cssTarget ?? merged.target,
+    cssMinify:
+      merged.cssMinify ??
+      (consumer === 'server' ? 'lightningcss' : !!merged.minify),
+    // Resolve to false | object
+    modulePreload:
+      merged.modulePreload === false
+        ? false
+        : merged.modulePreload === true
+          ? defaultModulePreload
+          : {
+              ...defaultModulePreload,
+              ...merged.modulePreload,
+            },
+  }
+  // The object spread above evaluates the `rollupOptions` getter set up on
+  // `merged` and copies it as a plain data property.
+  // 二次 setupRollupOptionCompat：上面对象展开会把 rollupOptions 的 getter 求值并拷成普通数据属性，
+  // 需要重新挂回 getter/setter，才能保持「读写 rollupOptions ⇄ rolldownOptions 互通」的兼容语义。
+  setupRollupOptionCompat(resolved)
+
+  return resolved
+}
+
+/**
+ * 作用：返回只在构建（或 bundled dev）时挂载的内置插件，分成 pre/post 两段插入主插件序列。
+ * 调用点：plugins/index.ts 的 resolvePlugins → buildPlugins.pre / buildPlugins.post。
+ * 关键参数：config.isWorker 决定是否追加 webWorkerPostPlugin、是否跳过 manifest 等只属于主构建的插件。
+ * 失败模式：本函数不抛；插件在各自 hook 里报错（例如 nativeLoadFallbackPlugin 找不到文件时才失败）。
+ */
+export function resolveBuildPlugins(config: ResolvedConfig): {
+  pre: Plugin[]
+  post: Plugin[]
+} {
+  const isBuild = config.command === 'build'
+  return {
+    pre: [
+      // pre 段在用户插件之前运行：先准备 outDir（prepareOutDirPlugin 挂 renderStart.order='pre'，
+      // 负责 emptyOutDir 与 copyPublicDir），再把用户 build.rolldownOptions.plugins 提前注入。
+      ...(isBuild && !config.isWorker ? [prepareOutDirPlugin()] : []),
+      perEnvironmentPlugin(
+        'vite:rollup-options-plugins',
+        async (environment) => {
+          if (!isBuild && !environment.config.isBundled) {
+            return false
+          }
+          return (
+            await asyncFlatten(
+              arraify(environment.config.build.rolldownOptions.plugins),
+            )
+          ).filter(Boolean) as Plugin[]
+        },
+      ),
+      ...(config.isWorker ? [webWorkerPostPlugin(config)] : []),
+    ],
+    post: [
+      // post 段顺序敏感：import 分析（注入 preload / 替换 __VITE_PRELOAD__）→ esbuild 转译（仅显式选 esbuild）
+      // → terser（仅显式选 terser）→ license/manifest/ssrManifest/reporter（都需要已定型的 bundle）。
+      ...(isBuild ? buildImportAnalysisPlugin(config) : []),
+      ...(isBuild && config.build.minify === 'esbuild'
+        ? [buildEsbuildPlugin()]
+        : []),
+      ...(isBuild ? [terserPlugin(config)] : []),
+      ...(isBuild && !config.isWorker
+        ? [
+            licensePlugin(),
+            manifestPlugin(),
+            ssrManifestPlugin(),
+            buildReporterPlugin(config),
+          ]
+        : []),
+      // 放在最末：rolldown 内置的 load 兜底插件，处理内置资源类型无法解析的情况。
+      nativeLoadFallbackPlugin(),
+    ],
+  }
+}
+
+/**
+ * Bundles a single environment for production.
+ * Returns a Promise containing the build result.
+ */
+/**
+ * 作用：编程式 API 的单环境构建入口（vite.build()）。
+ * 调用点：node/index.ts 对外导出；cli 的 build 命令不走这里，而是 createBuilder(inlineConfig, null) + buildApp()。
+ * 关键参数：useLegacyBuilder=true 表示只建一个环境（config.build.ssr ? 'ssr' : 'client'），忽略多环境配置。
+ * 失败模式：createBuilder 阶段配置解析失败会抛；环境为空时抛 'No environment found'。
+ */
+export async function build(
+  inlineConfig: InlineConfig = {},
+): Promise<RolldownOutput | RolldownOutput[] | RolldownWatcher> {
+  const builder = await createBuilder(inlineConfig, true)
+  const environment = Object.values(builder.environments)[0]
+  if (!environment) throw new Error('No environment found')
+  return builder.build(environment)
+}
+
+// 薄封装：固定 command='build'、mode 与环境都为 production、isSsrBuild=false，然后交给 config.ts 的 resolveConfig。
+// patchConfig / patchPlugins 是 createBuilder 注入的两个钩子，用于 legacy build 兼容与跨环境复用插件实例。
+function resolveConfigToBuild(
+  inlineConfig: InlineConfig = {},
+  patchConfig?: (config: ResolvedConfig) => void,
+  patchPlugins?: (resolvedPlugins: Plugin[]) => void,
+): Promise<ResolvedConfig> {
+  return resolveConfig(
+    inlineConfig,
+    'build',
+    'production',
+    'production',
+    false,
+    patchConfig,
+    patchPlugins,
+  )
+}
+
+/**
+ * 作用：把当前 Environment 的配置翻译成一份完整的 RolldownOptions —— 这是交给 rolldown 的唯一输入。
+ * 调用点：本文件 buildEnvironment()；server/bundledDev.ts 也复用它做「打包式 dev」。
+ * 关键参数：environment 提供 root/base/plugins；chunkMetadataMap 用于把 viteMetadata 注入每个 chunk。
+ * 失败模式：lib 缺 entry、SSR 的 input 是 html、cssCodeSplit:false 却把 CSS 当 input 时抛错（见下方三处 throw）。
+ */
+export function resolveRolldownOptions(
+  environment: Environment,
+  chunkMetadataMap: ChunkMetadataMap,
+): RolldownOptions {
+  const { root, packageCache, base, build: options } = environment.config
+  const libOptions = options.lib
+  const { logger } = environment
+  // consumer === 'server' 等价于旧的 build.ssr，但以 environment 为准（同一进程里可以同时存在多个 server 环境）。
+  const ssr = environment.config.consumer === 'server'
+
+  const resolve = (p: string) => path.resolve(root, p)
+  const topLevelInput = environment.config.input
+  if (libOptions && libOptions.entry == null) {
+    throw new Error(
+      `Either "build.lib.entry" or the top-level "input" option is required when "build.lib" is set.`,
+    )
+  }
+  // input 推导优先级：lib.entry（绝对化）> options.ssr 字符串 > rolldownOptions.input > 顶层 config.input > root/index.html。
+  // 也就是说「从 index.html 推导入口」只是最后一级兜底；HTML 里的 script 引用由后续 buildHtmlPlugin 继续处理。
+  const input = libOptions
+    ? options.rolldownOptions.input ||
+      (typeof libOptions.entry === 'string'
+        ? resolve(libOptions.entry)
+        : Array.isArray(libOptions.entry)
+          ? libOptions.entry.map(resolve)
+          : Object.fromEntries(
+              Object.entries(libOptions.entry!).map(([alias, file]) => [
+                alias,
+                resolve(file),
+              ]),
+            ))
+    : typeof options.ssr === 'string'
+      ? resolve(options.ssr)
+      : options.rolldownOptions.input ||
+        (topLevelInput ?? resolve('index.html'))
+
+  if (ssr && typeof input === 'string' && input.endsWith('.html')) {
+    // 硬约束：HTML 处理链（buildHtmlPlugin）只服务 client，SSR 必须显式给 JS 入口。
+    throw new Error(
+      `rolldownOptions.input should not be an html file when building for SSR. ` +
+        `Please specify a dedicated SSR entry.`,
+    )
+  }
+  if (options.cssCodeSplit === false) {
+    const inputs =
+      typeof input === 'string'
+        ? [input]
+        : Array.isArray(input)
+          ? input
+          : Object.values(input)
+    if (inputs.some((input) => CSS_LANGS_RE.test(input))) {
+      // cssCodeSplit:false 需要把所有 CSS 合成单文件，此时 CSS 不能再作为独立入口参与打包。
+      throw new Error(
+        `When "build.cssCodeSplit: false" is set, "rolldownOptions.input" should not include CSS files.`,
+      )
+    }
+  }
+
+  const outDir = resolve(options.outDir)
+
+  // inject environment and ssr arg to plugin load/transform hooks
+  // 每个插件都被包一层：hook 调用时注入 this.environment，并在渲染期顺带写入 viteMetadata（importedCss 等）。
+  const plugins = environment.plugins.map((p) =>
+    injectEnvironmentToHooks(environment, chunkMetadataMap, p),
+  )
+
+  const rolldownOptions: RolldownOptions = {
+    // 展开顺序有讲究：Vite 默认值 → 用户 rolldownOptions 覆盖 → 再覆盖回 Vite 必须掌控的字段
+    // （input/plugins/onLog/transform.define/moduleTypes/experimental），避免用户直接改掉这些关键语义。
+    // preserveEntrySignatures：SSR 需要允许入口导出被追加（allow-extension）；lib 用 strict 保证包体积可预测；
+    // 应用构建用 false，允许 rolldown 自由裁剪/合并入口导出。
+    preserveEntrySignatures: ssr
+      ? 'allow-extension'
+      : libOptions
+        ? 'strict'
+        : false,
+    // cache: options.watch ? undefined : false,
+    ...options.rolldownOptions,
+    tsconfig: environment.config.tsconfig ?? options.rolldownOptions.tsconfig,
+    resolve: environment.config.tsconfig
+      ? {
+          ...options.rolldownOptions.resolve,
+          tsconfigFilename: undefined,
+        }
+      : options.rolldownOptions.resolve,
+    input,
+    plugins,
+    onLog(level, log) {
+      // 日志统一走 onRollupLog：UNRESOLVED_IMPORT 会被升级为异常，其余按级别转给 environment.logger。
+      onRollupLog(level, log, environment)
+    },
+    transform: {
+      target: options.target === false ? undefined : options.target,
+      ...options.rolldownOptions.transform,
+      define: {
+        ...options.rolldownOptions.transform?.define,
+        // 必须把 process.env.NODE_ENV 显式置回自身，否则 rolldown 内建的替换会抢先于 definePlugin，
+        // 导致 dev 与 build 的环境变量语义不一致。
+        // disable builtin process.env.NODE_ENV replacement as it is handled by the define plugin
+        'process.env.NODE_ENV': 'process.env.NODE_ENV',
+      },
+    },
+    // CSS 一律先按 js 处理：CSS 由 Vite 的 cssPlugin/cssPostPlugin 收集与产出，rolldown 不解析 CSS 语义。
+    // TODO: remove this and enable rolldown's CSS support later
+    moduleTypes: {
+      ...options.rolldownOptions.moduleTypes,
+      '.css': 'js',
+    },
+    experimental: {
+      ...options.rolldownOptions.experimental,
+      // viteMode 通知 rolldown 走 Vite 语义（例如保留 __VITE_PRELOAD__ 占位符，交给 importAnalysisBuild 替换）。
+      viteMode: true,
+      // chunkImportMap:true 时补 baseUrl，让 rolldown 生成的 importmap 以项目 base 为根；false 时透传用户设置。
+      chunkImportMap: options.chunkImportMap
+        ? {
+            ...(typeof options.rolldownOptions.experimental?.chunkImportMap ===
+            'object'
+              ? options.rolldownOptions.experimental?.chunkImportMap
+              : {}),
+            baseUrl: base,
+          }
+        : options.rolldownOptions.experimental?.chunkImportMap,
+    },
+  }
+
+  // SSR 目标是 webworker 时产物按浏览器平台处理（不能引用 node 内置模块），单入口还能关掉 code splitting。
+  const isSsrTargetWebworkerEnvironment =
+    environment.name === 'ssr' &&
+    environment.getTopLevelConfig().ssr?.target === 'webworker'
+
+  // buildOutputOptions：rolldown 的 output 会按「格式」多次生成，这里把 Vite 的输出约定补进每一份 output。
+  const buildOutputOptions = (output: OutputOptions = {}): OutputOptions => {
+    // @ts-expect-error See https://github.com/vitejs/vite/issues/5812#issuecomment-984345618
+    if (output.output) {
+      logger.warn(
+        `You've set "rolldownOptions.output.output" in your config. ` +
+          `This is deprecated and will override all Vite.js default output options. ` +
+          `Please use "rolldownOptions.output" instead.`,
+      )
+    }
+    if (output.file) {
+      // Vite 的输出目录由 build.outDir 统一管理，不允许单文件输出，否则资源/HTML 无法按目录组织。
+      throw new Error(
+        `Vite does not support "rolldownOptions.output.file". ` +
+          `Please use "rolldownOptions.output.dir" and "rolldownOptions.output.entryFileNames" instead.`,
+      )
+    }
+    if (output.sourcemap) {
+      logger.warnOnce(
+        colors.yellow(
+          `Vite does not support "rolldownOptions.output.sourcemap". ` +
+            `Please use "build.sourcemap" instead.`,
+        ),
+      )
+    }
+
+    const format = output.format || 'es'
+    // 只有 SSR 与 lib 关心 .js/.mjs/.cjs 后缀（由 package.json type 决定），应用构建统一用 .js。
+    const jsExt =
+      (ssr && !isSsrTargetWebworkerEnvironment) || libOptions
+        ? resolveOutputJsExtension(
+            format,
+            findNearestPackageData(root, packageCache)?.data.type,
+          )
+        : 'js'
+    // minify 映射：'oxc' → true；lib 的 ES 产物只压代码不压空白（否则会删掉 /*#__PURE__*/，破坏下游 tree-shaking）；
+    // minify:false 时仍用 'dce-only'（只做死代码消除），而不是完全关闭。
+    const resolvedMinify =
+      options.minify === 'oxc'
+        ? libOptions && (format === 'es' || format === 'esm')
+          ? {
+              compress: true,
+              mangle: true,
+              // Do not minify whitespace for ES lib output since that would remove
+              // pure annotations and break tree-shaking
+              codegen: false,
+            }
+          : true
+        : options.minify === false
+          ? 'dce-only'
+          : false
+    return {
+      dir: outDir,
+      // Default format is 'es' for regular and for SSR builds
+      format,
+      exports: 'auto',
+      sourcemap: options.sourcemap,
+      name: libOptions ? libOptions.name : undefined,
+      // hoistTransitiveImports: libOptions ? false : undefined,
+      // es2015 enables `generatedCode.symbols`
+      // - #764 add `Symbol.toStringTag` when build es module into cjs chunk
+      // - #1048 add `Symbol.toStringTag` for module default export
+      generatedCode: {
+        preset: 'es2015',
+      },
+      entryFileNames: ssr
+        ? `[name].${jsExt}`
+        : libOptions
+          ? ({ name }) =>
+              resolveLibFilename(
+                libOptions,
+                format,
+                name,
+                root,
+                jsExt,
+                packageCache,
+              )
+          : path.posix.join(options.assetsDir, `[name]-[hash].${jsExt}`),
+      chunkFileNames: libOptions
+        ? `[name]-[hash].${jsExt}`
+        : path.posix.join(options.assetsDir, `[name]-[hash].${jsExt}`),
+      // 额外产出的资源（图片/字体/CSS）统一放 assetsDir 并带 hash；lib 模式保持 basename 便于发布。
+      assetFileNames: libOptions
+        ? `[name].[ext]`
+        : path.posix.join(options.assetsDir, `[name]-[hash].[ext]`),
+      // umd/iife 必须单文件；SSR webworker 单入口也关闭 splitting（worker 里没有动态 import 加载器）。
+      codeSplitting:
+        output.codeSplitting ??
+        (output.format === 'umd' ||
+        output.format === 'iife' ||
+        (isSsrTargetWebworkerEnvironment &&
+          (typeof input === 'string' || Object.keys(input).length === 1))
+          ? false
+          : undefined),
+      topLevelVar: true,
+      ...output,
+      // output 级别的 minify 可覆盖全局值：布尔直接覆盖，对象则与全局对象浅合并。
+      minify:
+        output.minify === undefined
+          ? resolvedMinify
+          : typeof output.minify === 'object' &&
+              typeof resolvedMinify === 'object'
+            ? { ...resolvedMinify, ...output.minify }
+            : output.minify,
+      // 注释保留策略：不 minify 时全保留；lib 的 ES 产物必须保留 annotation（/*#__PURE__*/）供下游 tree-shaking。
+      comments:
+        typeof output.comments === 'boolean'
+          ? output.comments
+          : {
+              // Do not minify whitespace for ES lib output since that would remove
+              // pure annotations and break tree-shaking
+              annotation:
+                !options.minify ||
+                (libOptions && (format === 'es' || format === 'esm')),
+              jsdoc: !options.minify,
+              legal: !options.minify,
+              ...output.comments,
+            },
+    }
+  }
+
+  // resolve lib mode outputs
+  // lib 模式下这里会把 formats 展开成多份 output（如 ['es','umd']），非 lib 则原样返回用户的 output 或 undefined。
+  const outputs = resolveBuildOutputs(
+    options.rolldownOptions.output,
+    libOptions,
+    logger,
+  )
+
+  if (Array.isArray(outputs)) {
+    rolldownOptions.output = outputs.map(buildOutputOptions)
+  } else {
+    rolldownOptions.output = buildOutputOptions(outputs)
+  }
+
+  return rolldownOptions
+}
+
+/**
+ * Build an App environment, or a App library (if libraryOptions is provided)
+ **/
+/**
+ * 作用：真正执行一个 environment 的打包——watch 模式创建 RolldownWatcher，否则 rolldown() 一次性构建并 write/generate。
+ * 调用点：本文件 createBuilder() 返回的 builder.build()；buildApp 与 legacy build() 最终都到这里。
+ * 关键参数：environment 携带自己那份 config/plugins；config.build.write 决定 write（落盘）还是 generate（仅内存）。
+ * 失败模式：rolldown 抛出的错误经 enhanceRollupError 加工后 rethrow；finally 一定 bundle.close() 释放资源。
+ */
+async function buildEnvironment(
+  environment: BuildEnvironment,
+): Promise<RolldownOutput | RolldownOutput[] | RolldownWatcher> {
+  const { logger, config } = environment
+  const { root, build: options } = config
+
+  logger.info(
+    colors.cyan(
+      `vite v${VERSION} ${colors.green(
+        `building ${environment.name} environment for ${environment.config.mode}...`,
+      )}`,
+    ),
+  )
+
+  let bundle: RolldownBuild | undefined
+  let startTime: number | undefined
+  try {
+    const chunkMetadataMap = new ChunkMetadataMap()
+    // 选项在这里才解析（每个 environment 一份）；watch 重建时复用同一个 chunkMetadataMap 以承载增量元数据。
+    const rolldownOptions = resolveRolldownOptions(
+      environment,
+      chunkMetadataMap,
+    )
+
+    // watch file changes with rollup
+    // watch 模式直接交给 rolldown 的 watch()：增量与失效由它自己管理，Vite 不再调用 rolldown()。
+    // 返回的 RolldownWatcher 由调用方持有；这里只注册 event 回调做日志与错误增强。
+    if (options.watch) {
+      logger.info(colors.cyan(`\nwatching for file changes...`))
+
+      const resolvedOutDirs = getResolvedOutDirs(
+        root,
+        options.outDir,
+        options.rolldownOptions.output,
+      )
+      const emptyOutDir = resolveEmptyOutDir(
+        options.emptyOutDir,
+        root,
+        resolvedOutDirs,
+        logger,
+      )
+      const resolvedChokidarOptions = resolveChokidarOptions(
+        {
+          // @ts-expect-error chokidar option does not exist in rolldown but used for backward compat
+          ...(rolldownOptions.watch || {}).chokidar,
+          // @ts-expect-error chokidar option does not exist in rolldown but used for backward compat
+          ...options.watch.chokidar,
+        },
+        resolvedOutDirs,
+        emptyOutDir,
+        environment.config.cacheDir,
+      )
+
+      const { watch } = await import('rolldown')
+      const watcher = watch({
+        ...rolldownOptions,
+        watch: {
+          ...rolldownOptions.watch,
+          ...options.watch,
+          watcher: convertToWatcherOptions(resolvedChokidarOptions),
+        },
+      })
+
+      watcher.on('event', (event) => {
+        if (event.code === 'BUNDLE_START') {
+          logger.info(colors.cyan(`\nbuild started...`))
+          // 清空「已重置」标记，renderChunk 才能在新一轮构建里重新初始化每个 chunk 的 viteMetadata。
+          chunkMetadataMap.clearResetChunks()
+        } else if (event.code === 'BUNDLE_END') {
+          // 必须 close，否则 watch 模式会累积上一轮的资源句柄。
+          event.result.close()
+          logger.info(colors.cyan(`built in ${event.duration}ms.`))
+        } else if (event.code === 'ERROR') {
+          const e = event.error
+          enhanceRollupError(e)
+          clearLine()
+          logger.error(e.message, { error: e })
+        }
+      })
+
+      return watcher
+    }
+
+    // write or generate files with rolldown
+    // 注意：这里就是「最终交给 rolldown」的实际调用点。此后所有产物处理都发生在 rolldown 的插件容器里
+    // （resolveRolldownOptions 已把 environment 上下文注入每个插件），而不是 server/pluginContainer.ts。
+    const { rolldown } = await import('rolldown')
+    startTime = Date.now()
+    bundle = await rolldown(rolldownOptions)
+
+    const res: RolldownOutput[] = []
+    // write:true 落盘（HTML/资源/manifest 同时写）；false 只 generate 到内存，SSR 与测试常用。
+    // lib 多格式时 output 是数组，需要按顺序逐个构建（rolldown 一次只接受一份 output）。
+    for (const output of arraify(rolldownOptions.output!)) {
+      res.push(await bundle[options.write ? 'write' : 'generate'](output))
+    }
+    for (const output of res) {
+      // 把 rolldown 的 chunk/asset 登记进 ChunkMetadataMap，后续插件（import 分析、reporter）才能读到 importedCss 等。
+      for (const chunk of output.output) {
+        injectChunkMetadata(chunkMetadataMap, chunk)
+      }
+    }
+    logger.info(
+      `${colors.green(`✓ built in ${displayTime(Date.now() - startTime)}`)}`,
+    )
+    return Array.isArray(rolldownOptions.output) ? res : res[0]
+  } catch (e) {
+    enhanceRollupError(e)
+    clearLine()
+    if (startTime) {
+      logger.error(
+        `${colors.red('✗')} Build failed in ${displayTime(Date.now() - startTime)}`,
+      )
+      startTime = undefined
+    }
+    throw e
+  } finally {
+    if (bundle) await bundle.close()
+  }
+}
+
+/**
+ * 作用：把 rolldown 的 RollupError 加工成 Vite 的展示格式（插件名 + 文件位置 + code frame），并重写 stack。
+ * 调用点：本文件 buildEnvironment() 的 catch 与 watch 的 ERROR 分支。
+ * 关键参数：e 会被原地修改（message/stack）；loc.frame 来自 rolldown 的报错。
+ * 失败模式：无；若 e 无 stack 则只改 message。
+ */
+export function enhanceRollupError(e: RollupError): void {
+  const stackOnly = extractStack(e)
+
+  let msg = colors.red((e.plugin ? `[${e.plugin}] ` : '') + e.message)
+  if (e.loc && e.loc.file && e.loc.file !== e.id) {
+    msg += `\nfile: ${colors.cyan(
+      `${e.loc.file}:${e.loc.line}:${e.loc.column}` +
+        (e.id ? ` (${e.id})` : ''),
+    )}`
+  } else if (e.id) {
+    msg += `\nfile: ${colors.cyan(
+      e.id + (e.loc ? `:${e.loc.line}:${e.loc.column}` : ''),
+    )}`
+  }
+  if (e.frame) {
+    msg += `\n` + colors.yellow(normalizeCodeFrame(e.frame))
+  }
+
+  e.message = msg
+
+  // We are rebuilding the stack trace to include the more detailed message at the top.
+  // Previously this code was relying on mutating e.message changing the generated stack
+  // when it was accessed, but we don't have any guarantees that the error we are working
+  // with hasn't already had its stack accessed before we get here.
+  if (stackOnly !== undefined) {
+    e.stack = `${e.message}\n${stackOnly}`
+  }
+}
+
+/**
+ * The stack string usually contains a copy of the message at the start of the stack.
+ * If the stack starts with the message, we remove it and just return the stack trace
+ * portion. Otherwise the original stack trace is used.
+ */
+function extractStack(e: RollupError) {
+  // 只剥掉 stack 开头那行「name: message」，保留真正的调用栈；剥不掉就原样返回。
+  const { stack, name = 'Error', message } = e
+
+  // If we don't have a stack, not much we can do.
+  if (!stack) {
+    return stack
+  }
+
+  const expectedPrefix = `${name}: ${message}\n`
+  if (stack.startsWith(expectedPrefix)) {
+    return stack.slice(expectedPrefix.length)
+  }
+
+  return stack
+}
+
+/**
+ * Esbuild code frames have newlines at the start and end of the frame, rollup doesn't
+ * This function normalizes the frame to match the esbuild format which has more pleasing padding
+ */
+function normalizeCodeFrame(frame: string) {
+  // esbuild 风格的 code frame 首尾各带一个换行；rolldown 不带，统一补上以保持终端输出对齐。
+  const trimmedPadding = frame.replace(/^\n|\n$/g, '')
+  return `\n${trimmedPadding}\n`
+}
+
+type JsExt = 'js' | 'cjs' | 'mjs'
+
+// 作用：按 package.json 的 type 与输出格式决定 .js/.mjs/.cjs 后缀，避免 Node 把 ESM 当 CJS 加载。
+// 调用点：本文件 buildOutputOptions() 与 resolveLibFilename()。
+// 失败模式：无；type 缺省按 commonjs 处理。
+function resolveOutputJsExtension(
+  format: ModuleFormat,
+  type: string = 'commonjs',
+): JsExt {
+  if (type === 'module') {
+    return format === 'cjs' || format === 'umd' ? 'cjs' : 'js'
+  } else {
+    return format === 'es' ? 'mjs' : 'js'
+  }
+}
+
+/**
+ * 作用：lib 模式的产物文件名——支持用户函数，也支持「优先用 fileName，其次包名，最后入口名」的推导。
+ * 调用点：本文件 resolveRolldownOptions() 的 entryFileNames 回调（lib 分支）。
+ * 关键参数：format 决定是否加 .umd/.iife 中缀；extension 缺省时按 package.json type 推导。
+ * 失败模式：既无 fileName、包名又无 entryName 时抛错（提示需要 package.json name）。
+ */
+export function resolveLibFilename(
+  libOptions: LibraryOptions,
+  format: ModuleFormat,
+  entryName: string,
+  root: string,
+  extension?: JsExt,
+  packageCache?: PackageCache,
+): string {
+  if (typeof libOptions.fileName === 'function') {
+    return libOptions.fileName(format, entryName)
+  }
+
+  const packageJson = findNearestMainPackageData(root, packageCache)?.data
+  const name =
+    libOptions.fileName ||
+    (packageJson && typeof libOptions.entry === 'string'
+      ? getPkgName(packageJson.name)
+      : entryName)
+
+  if (!name)
+    throw new Error(
+      'Name in package.json is required if option "build.lib.fileName" is not provided.',
+    )
+
+  extension ??= resolveOutputJsExtension(format, packageJson?.type)
+
+  if (format === 'cjs' || format === 'es') {
+    return `${name}.${extension}`
+  }
+
+  return `${name}.${format}.${extension}`
+}
+
+/**
+ * 作用：把 lib 的 formats 展开成多份 output，并在 umd/iife 场景校验「单入口 + 必须有 name」。
+ * 调用点：本文件 resolveRolldownOptions()；测试 build.spec.ts 也直接调用。
+ * 关键参数：outputs 是用户显式配置的 rolldownOptions.output；libOptions 为 false 时原样返回。
+ * 失败模式：多入口 + umd/iife、或 umd/iife 缺 name 时抛错；用户已显式给 output 数组时 formats 被忽略并警告。
+ */
+export function resolveBuildOutputs(
+  outputs: OutputOptions | OutputOptions[] | undefined,
+  libOptions: LibraryOptions | false,
+  logger: Logger,
+): OutputOptions | OutputOptions[] | undefined {
+  if (libOptions) {
+    const libHasMultipleEntries =
+      typeof libOptions.entry !== 'string' &&
+      libOptions.entry &&
+      Object.values(libOptions.entry).length > 1
+    const libFormats =
+      libOptions.formats ||
+      (libHasMultipleEntries ? ['es', 'cjs'] : ['es', 'umd'])
+
+    if (!Array.isArray(outputs)) {
+      if (libFormats.includes('umd') || libFormats.includes('iife')) {
+        if (libHasMultipleEntries) {
+          throw new Error(
+            'Multiple entry points are not supported when output formats include "umd" or "iife".',
+          )
+        }
+
+        if (!libOptions.name) {
+          throw new Error(
+            'Option "build.lib.name" is required when output formats include "umd" or "iife".',
+          )
+        }
+      }
+
+      return libFormats.map((format) => ({ ...outputs, format }))
+    }
+
+    // By this point, we know "outputs" is an Array.
+    if (libOptions.formats) {
+      logger.warn(
+        colors.yellow(
+          '"build.lib.formats" will be ignored because "build.rolldownOptions.output" is already an array format.',
+        ),
+      )
+    }
+
+    outputs.forEach((output) => {
+      if (
+        (output.format === 'umd' || output.format === 'iife') &&
+        !output.name
+      ) {
+        throw new Error(
+          'Entries in "build.rolldownOptions.output" must specify "name" when the format is "umd" or "iife".',
+        )
+      }
+    })
+  }
+
+  return outputs
+}
+
+const warningIgnoreList = [`CIRCULAR_DEPENDENCY`, `THIS_IS_UNDEFINED`]
+const dynamicImportWarningIgnoreList = [
+  `Unsupported expression`,
+  `statically analyzed`,
+]
+
+export function clearLine(): void {
+  const tty = process.stdout.isTTY && !process.env.CI
+  if (tty) {
+    process.stdout.clearLine(0)
+    process.stdout.cursorTo(0)
+  }
+}
+
+/**
+ * 作用：rolldown 的日志入口——按级别转给 environment.logger，并处理必须升级为错误的场景。
+ * 调用点：本文件 resolveRolldownOptions() 的 onLog 字段，以及 normalizeUserOnWarn 的默认回调。
+ * 关键参数：level 来自 rolldown；log 可能带 code/id/exporter/plugin。
+ * 失败模式：UNRESOLVED_IMPORT 且不是 ?commonjs-external 时直接 throw，阻止产出半成品。
+ */
+export function onRollupLog(
+  level: LogLevel,
+  log: RollupLog,
+  environment: Environment,
+): void {
+  const debugLogger = createDebugger('vite:build')
+  const viteLog: LogOrStringHandler = (logLeveling, rawLogging) => {
+    const logging =
+      typeof rawLogging === 'object' ? rawLogging : { message: rawLogging }
+
+    if (logging.code === 'UNRESOLVED_IMPORT') {
+      const id = logging.id
+      const exporter = logging.exporter
+      // throw unless it's commonjs external...
+      // 未解析的 import 在浏览器里必然运行时报错，所以这里直接中断构建（CJS 外部化的占位除外）。
+      if (!id || !id.endsWith('?commonjs-external')) {
+        throw new Error(
+          `[vite]: Rolldown failed to resolve import "${exporter}" from "${id}".\n` +
+            `This is most likely unintended because it can break your application at runtime.\n` +
+            `If you do want to externalize this module explicitly add it to\n` +
+            `\`build.rolldownOptions.external\``,
+        )
+      }
+    }
+
+    if (logLeveling === 'warn') {
+      if (
+        logging.plugin === 'rollup-plugin-dynamic-import-variables' &&
+        dynamicImportWarningIgnoreList.some((msg) =>
+          logging.message.includes(msg),
+        )
+      ) {
+        return
+      }
+
+      if (warningIgnoreList.includes(logging.code!)) {
+        return
+      }
+    }
+
+    // append plugin name to align with Rollup's behavior
+    // rolldown 的 log 不一定带 plugin 前缀，这里补齐以贴合用户熟悉的 rollup 输出格式。
+    let message = logging.message
+    if (logging.plugin) {
+      message = `[plugin ${logging.plugin}] ${message}`
+    }
+
+    switch (logLeveling) {
+      case 'info':
+        environment.logger.info(message)
+        return
+      case 'warn':
+        environment.logger.warn(colors.yellow(message))
+        return
+      case 'error':
+        environment.logger.error(colors.red(message))
+        return
+      case 'debug':
+        debugLogger?.(message)
+        return
+      default:
+        logLeveling satisfies never
+        // fallback to info if a unknown log level is passed
+        environment.logger.info(message)
+        return
+    }
+  }
+
+  clearLine()
+  const userOnLog = environment.config.build.rolldownOptions?.onLog
+  const userOnWarn = environment.config.build.rolldownOptions?.onwarn
+  if (userOnLog) {
+    if (userOnWarn) {
+      const normalizedUserOnWarn = normalizeUserOnWarn(userOnWarn, viteLog)
+      userOnLog(level, log, normalizedUserOnWarn)
+    } else {
+      userOnLog(level, log, viteLog)
+    }
+  } else if (userOnWarn) {
+    const normalizedUserOnWarn = normalizeUserOnWarn(userOnWarn, viteLog)
+    normalizedUserOnWarn(level, log)
+  } else {
+    viteLog(level, log)
+  }
+}
+
+function normalizeUserOnWarn(
+  userOnWarn: WarningHandlerWithDefault,
+  defaultHandler: LogOrStringHandler,
+): LogOrStringHandler {
+  return (logLevel, logging) => {
+    if (logLevel === 'warn') {
+      userOnWarn(normalizeLog(logging), (log) =>
+        defaultHandler('warn', typeof log === 'function' ? log() : log),
+      )
+    } else {
+      defaultHandler(logLevel, logging)
+    }
+  }
+}
+
+const normalizeLog = (log: RollupLog | string): RollupLog =>
+  typeof log === 'string' ? { message: log } : log
+
+export function resolveUserExternal(
+  user: ExternalOption,
+  id: string,
+  parentId: string | undefined,
+  isResolved: boolean,
+): boolean | null | void {
+  if (typeof user === 'function') {
+    return user(id, parentId, isResolved)
+  } else if (Array.isArray(user)) {
+    return user.some((test) => isExternal(id, test))
+  } else {
+    return isExternal(id, user)
+  }
+}
+
+function isExternal(id: string, test: string | RegExp) {
+  if (typeof test === 'string') {
+    return id === test
+  } else {
+    return test.test(id)
+  }
+}
+
+/**
+ * 作用：承载每个 chunk 的 Vite 元数据（importedCss / importedAssets / __modules），并支持 watch 下的重置。
+ * 调用点：resolveRolldownOptions 的插件包装、injectChunkMetadata、buildEnvironment 的产物登记。
+ * 关键不变量：key 优先用 preliminaryFileName（hash 未定的中间名），否则 fileName；同一 key 只初始化一次。
+ * 失败模式：无（Map 兜底为默认空集合）。
+ */
+export class ChunkMetadataMap {
+  private _inner = new Map<string, ChunkMetadata | AssetMetadata>()
+  private _resetChunks = new Set<string>()
+
+  private _getKey(chunk: RenderedChunk | OutputChunk | OutputAsset): string {
+    return 'preliminaryFileName' in chunk
+      ? chunk.preliminaryFileName
+      : chunk.fileName
+  }
+
+  private _getDefaultValue(
+    chunk: RenderedChunk | OutputChunk | OutputAsset,
+  ): ChunkMetadata | AssetMetadata {
+    return chunk.type === 'chunk'
+      ? {
+          importedAssets: new Set(),
+          importedCss: new Set(),
+          // NOTE: adding this as a workaround for now ideally we'd want to remove this workaround
+          // use shared `chunk.modules` object to allow mutation on js side plugins
+          __modules: chunk.modules,
+        }
+      : {
+          importedAssets: new Set(),
+          importedCss: new Set(),
+        }
+  }
+
+  get(
+    chunk: RenderedChunk | OutputChunk | OutputAsset,
+  ): ChunkMetadata | AssetMetadata {
+    const key = this._getKey(chunk)
+    if (!this._inner.has(key)) {
+      this._inner.set(key, this._getDefaultValue(chunk))
+    }
+    return this._inner.get(key)!
+  }
+
+  // reset chunk metadata on the first RenderChunk call for watch mode
+  // watch 下同一个 chunk 会跨轮复用，只有本轮第一次 renderChunk 时才清空，避免把同轮其他插件刚写入的元数据抹掉。
+  reset(chunk: RenderedChunk | OutputChunk | OutputAsset): void {
+    const key = this._getKey(chunk)
+    if (this._resetChunks.has(key)) return
+
+    this._resetChunks.add(key)
+    this._inner.set(key, this._getDefaultValue(chunk))
+  }
+
+  clearResetChunks(): void {
+    // 在 watch 的 BUNDLE_START 调用：清掉「本轮已重置」记录，下一轮才能重新触发 reset。
+    this._resetChunks.clear()
+  }
+}
+
+/**
+ * 作用：给插件做一份「带 environment 上下文」的克隆，把 resolveId/load/transform 与其余 ROLLUP_HOOKS 包一层。
+ * 调用点：本文件 resolveRolldownOptions()，对 environment.plugins 逐个调用后交给 rolldown。
+ * 关键参数：chunkMetadataMap 用于在渲染类 hook 前后写入 viteMetadata。
+ * 失败模式：不抛；但对 class 实例（native 插件）只克隆自身可枚举属性，原型方法通过 Object.create 保留。
+ */
+export function injectEnvironmentToHooks(
+  environment: Environment,
+  chunkMetadataMap: ChunkMetadataMap,
+  plugin: Plugin,
+): Plugin {
+  const { resolveId, load, transform } = plugin
+
+  // the plugin can be a class instance (e.g. native plugins)
+  // 用原型链克隆：既保留 class 原型上的方法，又避免包装时改动用户/内置的原始插件对象。
+  const clone: Plugin = Object.assign(
+    Object.create(Object.getPrototypeOf(plugin)),
+    plugin,
+  )
+
+  for (const hook of Object.keys(clone) as RollupPluginHooks[]) {
+    switch (hook) {
+      case 'resolveId':
+        clone[hook] = wrapEnvironmentResolveId(
+          environment,
+          resolveId,
+          plugin.name,
+        )
+        break
+      case 'load':
+        clone[hook] = wrapEnvironmentLoad(environment, load, plugin.name)
+        break
+      case 'transform':
+        clone[hook] = wrapEnvironmentTransform(
+          environment,
+          transform,
+          plugin.name,
+        )
+        break
+      default:
+        if (ROLLUP_HOOKS.includes(hook)) {
+          ;(clone as any)[hook] = wrapEnvironmentHook(
+            environment,
+            chunkMetadataMap,
+            plugin,
+            hook,
+          )
+        }
+        break
+    }
+  }
+
+  return clone
+}
+
+type AbstractHook<Handler extends Function> = {
+  handler: Handler
+  filter?: unknown
+  order?: unknown
+}
+const wrappedHookMap = new WeakMap<
+  AbstractHook<Function>,
+  Array<AbstractHook<Function>>
+>()
+// 作用：包装 `{ handler, order, filter }` 形式的对象式 hook。
+// 关键点：filter/order 用访问器代理到所有派生 hook 上，这样 rolldown 读 filter 与后续修改 order 都能保持一致。
+function wrapHookObject<
+  Handler extends Function,
+  Hook extends AbstractHook<Handler>,
+>(hook: Hook, handler: Handler): Hook {
+  const newHook = {
+    ...hook,
+    handler,
+  }
+
+  if (!wrappedHookMap.has(hook)) {
+    wrappedHookMap.set(hook, [])
+    Object.defineProperty(hook, 'filter', {
+      get() {
+        return wrappedHookMap.get(hook)![0].filter
+      },
+      set(v) {
+        for (const h of wrappedHookMap.get(hook)!) {
+          h.filter = v
+        }
+      },
+    })
+    Object.defineProperty(hook, 'order', {
+      get() {
+        return wrappedHookMap.get(hook)![0].order
+      },
+      set(v) {
+        for (const h of wrappedHookMap.get(hook)!) {
+          h.order = v
+        }
+      },
+    })
+  }
+  wrappedHookMap.get(hook)!.push(newHook)
+
+  return newHook
+}
+
+// 作用：包装 resolveId —— 注入 this.environment 与兼容用的 ssr 参数。
+// 调用点：injectEnvironmentToHooks 的 switch 分支。
+// 失败模式：hook 不存在时返回 undefined（该插件就没有此 hook）。
+function wrapEnvironmentResolveId(
+  environment: Environment,
+  hook: Plugin['resolveId'] | undefined,
+  pluginName: string,
+): Plugin['resolveId'] {
+  if (!hook) return
+
+  const fn = getHookHandler(hook)
+  const handler: Plugin['resolveId'] = function (id, importer, options) {
+    return fn.call(
+      injectEnvironmentInContext(this, environment),
+      id,
+      importer,
+      injectSsrFlag(options, environment, pluginName),
+    )
+  }
+
+  if ('handler' in hook) {
+    return wrapHookObject(hook, handler)
+  } else {
+    return handler
+  }
+}
+
+// 作用：包装 load —— 注入 environment，并把 options.ssr 传给旧式插件。
+function wrapEnvironmentLoad(
+  environment: Environment,
+  hook: Plugin['load'] | undefined,
+  pluginName: string,
+): Plugin['load'] {
+  if (!hook) return
+
+  const fn = getHookHandler(hook)
+  const handler: Plugin['load'] = function (id, ...args) {
+    return fn.call(
+      injectEnvironmentInContext(this, environment),
+      id,
+      injectSsrFlag(args[0], environment, pluginName),
+    )
+  }
+
+  if ('handler' in hook) {
+    return wrapHookObject(hook, handler)
+  } else {
+    return handler
+  }
+}
+
+// 作用：包装 transform —— 注入 environment，并把 options.ssr 传给旧式插件。
+function wrapEnvironmentTransform(
+  environment: Environment,
+  hook: Plugin['transform'] | undefined,
+  pluginName: string,
+): Plugin['transform'] {
+  if (!hook) return
+
+  const fn = getHookHandler(hook)
+  const handler: Plugin['transform'] = function (code, importer, ...args) {
+    return fn.call(
+      injectEnvironmentInContext(this, environment),
+      code,
+      importer,
+      injectSsrFlag(args[0], environment, pluginName),
+    )
+  }
+
+  if ('handler' in hook) {
+    return wrapHookObject(hook, handler)
+  } else {
+    return handler
+  }
+}
+
+// 作用：包装其余 rollup 风格 hook（renderChunk/augmentChunkHash/generateBundle/writeBundle 等）。
+// 关键点：进入用户 hook 前先把 viteMetadata 补到 chunk 上——这是「Vite 元数据」与 rolldown 产物之间的桥。
+// 顺序：renderChunk 传 reset=true（本轮首次重置），augmentChunkHash/generateBundle 只读不重置。
+function wrapEnvironmentHook<HookName extends keyof Plugin>(
+  environment: Environment,
+  chunkMetadataMap: ChunkMetadataMap,
+  plugin: Plugin,
+  hookName: HookName,
+): Plugin[HookName] {
+  const hook = plugin[hookName]
+  if (!hook) return
+
+  const fn = getHookHandler(hook)
+  if (typeof fn !== 'function') return hook
+
+  const handler: Plugin[HookName] = function (
+    this: PluginContext,
+    ...args: any[]
+  ) {
+    if (hookName === 'renderChunk') {
+      // 参数顺序是 (code, chunk, options)：chunk 在 args[1]，这里顺便完成 watch 下的首轮重置。
+      injectChunkMetadata(chunkMetadataMap, args[1], true)
+    }
+    if (hookName === 'augmentChunkHash') {
+      // 参数是 (chunk)，hash 计算阶段只能读元数据，不能重置。
+      injectChunkMetadata(chunkMetadataMap, args[0])
+    }
+    if (hookName === 'generateBundle' || hookName === 'writeBundle') {
+      // 这两个 hook 拿到整个 bundle，需要把元数据补到所有 chunk/asset 上（含纯 CSS 资产）。
+      const bundle = args[1] as OutputBundle
+      for (const chunk of Object.values(bundle)) {
+        injectChunkMetadata(chunkMetadataMap, chunk)
+      }
+    }
+    return fn.call(injectEnvironmentInContext(this, environment), ...args)
+  }
+
+  if ('handler' in hook) {
+    return wrapHookObject(hook, handler)
+  } else {
+    return handler
+  }
+}
+
+function injectChunkMetadata(
+  chunkMetadataMap: ChunkMetadataMap,
+  chunk: RenderedChunk | OutputChunk | OutputAsset,
+  resetChunkMetadata = false,
+) {
+  // reset 只在 renderChunk 首次调用时发生，保证同一轮里其他插件写入的 importedCss 不会被后续 hook 清掉。
+  if (resetChunkMetadata) {
+    chunkMetadataMap.reset(chunk)
+  }
+  // define instead of assign to avoid detected as a change
+  // https://github.com/rolldown/rolldown/blob/f4c5ff27799f2b0152c689c398e61bc7d30429ff/packages/rolldown/src/utils/transform-to-rollup-output.ts#L87
+  Object.defineProperty(chunk, 'viteMetadata', {
+    value: chunkMetadataMap.get(chunk),
+    enumerable: true,
+  })
+  if (chunk.type === 'chunk') {
+    Object.defineProperty(chunk, 'modules', {
+      // modules 走 getter：rolldown 的 chunk.modules 是只读快照，这里改为转发到 viteMetadata.__modules，
+      // 让 JS 侧插件对 modules 的修改在后续 hook 中可见。
+      get() {
+        return chunk.viteMetadata!.__modules
+      },
+      enumerable: true,
+    })
+  }
+}
+
+function injectEnvironmentInContext<Context extends MinimalPluginContext>(
+  context: Context,
+  environment: Environment,
+) {
+  // 只在缺失时赋值：同一插件实例可能被多个 hook 复用，重复覆盖会丢失外部已设置的值。
+  context.meta.viteVersion ??= VERSION
+  context.environment ??= environment
+  return context
+}
+
+function injectSsrFlag<T extends Record<string, any>>(
+  options: T | undefined,
+  environment: Environment,
+  pluginName: string,
+): T & { ssr?: boolean } {
+  // 这是 Vite 5 之前插件 API 的兼容层：新插件应该用 this.environment.config.consumer 判断。
+  // 开启 future deprecation 后，读 ssr 会触发警告（访问器延迟到真正被读时才 warn）。
+  let ssr = environment.config.consumer === 'server'
+  const newOptions = { ...options, ssr } as T & {
+    ssr?: boolean
+  }
+
+  if (
+    isFutureDeprecationEnabled(
+      environment?.getTopLevelConfig(),
+      'removePluginHookSsrArgument',
+    )
+  ) {
+    Object.defineProperty(newOptions, 'ssr', {
+      get() {
+        warnFutureDeprecation(
+          environment?.getTopLevelConfig(),
+          'removePluginHookSsrArgument',
+          `Used in plugin "${pluginName}".`,
+        )
+        return ssr
+      },
+      set(v) {
+        ssr = v
+      },
+    })
+  }
+
+  return newOptions
+}
+
+/*
+  The following functions are copied from rollup
+  https://github.com/rollup/rollup/blob/ce6cb93098850a46fa242e37b74a919e99a5de28/src/ast/nodes/MetaProperty.ts#L155-L203
+
+  https://github.com/rollup/rollup
+  The MIT License (MIT)
+  Copyright (c) 2017 [these people](https://github.com/rollup/rollup/graphs/contributors)
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+const needsEscapeRegEx = /[\n\r'\\\u2028\u2029]/
+const quoteNewlineRegEx = /([\n\r'\u2028\u2029])/g
+const backSlashRegEx = /\\/g
+
+function escapeId(id: string): string {
+  if (!needsEscapeRegEx.test(id)) return id
+  return id.replace(backSlashRegEx, '\\\\').replace(quoteNewlineRegEx, '\\$1')
+}
+
+const getResolveUrl = (path: string, URL = 'URL') => `new ${URL}(${path}).href`
+
+const getRelativeUrlFromDocument = (relativePath: string, umd = false) =>
+  getResolveUrl(
+    `'${escapeId(partialEncodeURIPath(relativePath))}', ${
+      umd ? `typeof document === 'undefined' ? location.href : ` : ''
+    }document.currentScript && document.currentScript.tagName.toUpperCase() === 'SCRIPT' && document.currentScript.src || document.baseURI`,
+  )
+
+const getFileUrlFromFullPath = (path: string) =>
+  `require('u' + 'rl').pathToFileURL(${path}).href`
+
+const getFileUrlFromRelativePath = (path: string) =>
+  getFileUrlFromFullPath(`__dirname + '/${escapeId(path)}'`)
+
+const relativeUrlMechanisms: Record<
+  InternalModuleFormat,
+  (relativePath: string) => string
+> = {
+  // 每种输出格式在「浏览器 / Node」两种宿主下解析相对 URL 的表达式不同：
+  // cjs 用 __dirname 兜底（Node），umd/iife 用 document.baseURI，es 用 import.meta.url。
+  // 这些片段会被拼进产物，所以必须用 escapeId 处理换行/引号/反斜杠。
+  // amd: (relativePath) => {
+  //   if (relativePath[0] !== '.') relativePath = './' + relativePath
+  //   return getResolveUrl(
+  //     `require.toUrl('${escapeId(relativePath)}'), document.baseURI`,
+  //   )
+  // },
+  cjs: (relativePath) =>
+    `(typeof document === 'undefined' ? ${getFileUrlFromRelativePath(
+      relativePath,
+    )} : ${getRelativeUrlFromDocument(relativePath)})`,
+  es: (relativePath) =>
+    getResolveUrl(
+      `'${escapeId(partialEncodeURIPath(relativePath))}', import.meta.url`,
+    ),
+  iife: (relativePath) => getRelativeUrlFromDocument(relativePath),
+  // NOTE: make sure rollup generate `module` params
+  // system: (relativePath) =>
+  //   getResolveUrl(
+  //     `'${escapeId(partialEncodeURIPath(relativePath))}', module.meta.url`,
+  //   ),
+  umd: (relativePath) =>
+    `(typeof document === 'undefined' && typeof location === 'undefined' ? ${getFileUrlFromRelativePath(
+      relativePath,
+    )} : ${getRelativeUrlFromDocument(relativePath, true)})`,
+}
+/* end of copy */
+
+const customRelativeUrlMechanisms = {
+  ...relativeUrlMechanisms,
+  'worker-iife': (relativePath) =>
+    getResolveUrl(
+      `'${escapeId(partialEncodeURIPath(relativePath))}', self.location.href`,
+    ),
+} as const satisfies Record<string, (relativePath: string) => string>
+
+export type RenderBuiltAssetUrl = (
+  filename: string,
+  type: {
+    type: 'asset' | 'public'
+    hostId: string
+    hostType: 'js' | 'css' | 'html'
+    ssr: boolean
+  },
+) => string | { relative?: boolean; runtime?: string } | undefined
+
+/**
+ * 作用：把产物文件名（相对 outDir）转换成最终 URL —— 可能是静态字符串，也可能是一段运行时表达式。
+ * 调用点：plugins/asset.ts 的 assetPlugin、plugins/css.ts 的 cssPostPlugin、本文件 importAnalysisBuild 的 preload 列表。
+ * 关键参数：hostId/hostType 用于 renderBuiltUrl 回调；toRelative 由调用方按宿主格式提供（JS/CSS/HTML 各不相同）。
+ * 失败模式：不抛；renderBuiltUrl 返回 { runtime } 时直接透传，由调用方决定如何注入。
+ * 语义：先问 renderBuiltUrl（实验特性），其次 relative（base 为 '' 或 './' 时默认相对），最后拼 decodedBase。
+ */
+export function toOutputFilePathInJS(
+  environment: PartialEnvironment,
+  filename: string,
+  type: 'asset' | 'public',
+  hostId: string,
+  hostType: 'js' | 'css' | 'html',
+  toRelative: (
+    filename: string,
+    hostType: string,
+  ) => string | { runtime: string },
+): string | { runtime: string } {
+  const { experimental, base, decodedBase } = environment.config
+  // 注意这里用 consumer 重新判断，而不是读 build.ssr：多环境构建下 build.ssr 可能不代表当前环境。
+  const ssr = environment.config.consumer === 'server' // was !!environment.config.build.ssr
+  const { renderBuiltUrl } = experimental
+  // base 为 '' 或 './'（相对 base）时默认输出相对路径；否则拼 base 前缀。
+  let relative = base === '' || base === './'
+  if (renderBuiltUrl) {
+    const result = renderBuiltUrl(filename, {
+      hostId,
+      hostType,
+      type,
+      ssr,
+    })
+    if (typeof result === 'object') {
+      if (result.runtime) {
+        return { runtime: result.runtime }
+      }
+      if (typeof result.relative === 'boolean') {
+        relative = result.relative
+      }
+    } else if (result) {
+      return result
+    }
+  }
+  if (relative && !ssr) {
+    return toRelative(filename, hostId)
+  }
+  return joinUrlSegments(decodedBase, filename)
+}
+
+// 作用：构造一个「基于 import.meta.url / document.currentScript 的相对路径运行时」。
+// 调用点：asset.ts 的 toOutputFilePathInJSForBundledDev 等，把 { runtime } 结果内联进产物。
+// 关键参数：isWorker 且 format=iife 时走特殊的 'worker-iife' 机制（用 self.location.href）。
+export function createToImportMetaURLBasedRelativeRuntime(
+  format: InternalModuleFormat,
+  isWorker: boolean,
+): (filename: string, importer: string) => { runtime: string } {
+  const formatLong = isWorker && format === 'iife' ? 'worker-iife' : format
+  const toRelativePath = customRelativeUrlMechanisms[formatLong]
+  return (filename, importer) => ({
+    runtime: toRelativePath(
+      path.posix.relative(path.dirname(importer), filename),
+    ),
+  })
+}
+
+/**
+ * 作用：CSS/HTML 里的资源 URL 解析——与 toOutputFilePathInJS 同逻辑，但不支持 runtime 形式。
+ * 调用点：本文件导出为 toOutputFilePathInCss / toOutputFilePathInHtml（plugins/css.ts、plugins/html.ts 使用）。
+ * 关键参数：config 是顶层配置（这里仍读 build.ssr，属于历史兼容）。
+ * 失败模式：renderBuiltUrl 返回 { runtime } 时抛错——CSS/HTML 无法插入运行时代码。
+ */
+export function toOutputFilePathWithoutRuntime(
+  filename: string,
+  type: 'asset' | 'public',
+  hostId: string,
+  hostType: 'js' | 'css' | 'html',
+  config: ResolvedConfig,
+  toRelative: (filename: string, hostId: string) => string,
+): string {
+  const { renderBuiltUrl } = config.experimental
+  let relative = config.base === '' || config.base === './'
+  if (renderBuiltUrl) {
+    const result = renderBuiltUrl(filename, {
+      hostId,
+      hostType,
+      type,
+      ssr: !!config.build.ssr,
+    })
+    if (typeof result === 'object') {
+      if (result.runtime) {
+        throw new Error(
+          `{ runtime: "${result.runtime}" } is not supported for assets in ${hostType} files: ${filename}`,
+        )
+      }
+      if (typeof result.relative === 'boolean') {
+        relative = result.relative
+      }
+    } else if (result) {
+      return result
+    }
+  }
+  if (relative && !config.build.ssr) {
+    return toRelative(filename, hostId)
+  } else {
+    return joinUrlSegments(config.decodedBase, filename)
+  }
+}
+
+export const toOutputFilePathInCss: typeof toOutputFilePathWithoutRuntime =
+  toOutputFilePathWithoutRuntime
+export const toOutputFilePathInHtml: typeof toOutputFilePathWithoutRuntime =
+  toOutputFilePathWithoutRuntime
+
+export class BuildEnvironment extends BaseEnvironment {
+  // mode 固定为 build：决定插件内部走 dev 分支还是 build 分支（例如 env 注入、HMR 相关逻辑）。
+  mode = 'build' as const
+
+  // isBuilt 由 createBuilder 的 builder.build() 置位，buildApp 用它判断「是否已有环境被显式构建过」。
+  isBuilt = false
+
+  /**
+   * The build manifest for this environment. It is populated once the
+   * environment has been built and is available regardless of the
+   * `build.manifest` option, which only controls whether the manifest file is
+   * written to disk. This allows accessing the manifest in the `buildApp` hook
+   * without reading it from the file system.
+   *
+   * @experimental
+   */
+  manifest?: Manifest
+
+  constructor(
+    name: string,
+    config: ResolvedConfig,
+    setup?: {
+      options?: EnvironmentOptions
+    },
+  ) {
+    let options = config.environments[name]
+    if (!options) {
+      throw new Error(`Environment "${name}" is not defined in the config.`)
+    }
+    if (setup?.options) {
+      options = mergeConfig(
+        options,
+        setup.options,
+      ) as ResolvedEnvironmentOptions
+    }
+    super(name, config, options)
+  }
+
+  async init(): Promise<void> {
+    if (this._initiated) {
+      return
+    }
+    this._initiated = true
+  }
+}
+
+export interface ViteBuilder {
+  environments: Record<string, BuildEnvironment>
+  config: ResolvedConfig
+  buildApp(): Promise<void>
+  build(
+    environment: BuildEnvironment,
+  ): Promise<RolldownOutput | RolldownOutput[] | RolldownWatcher>
+  runDevTools(): Promise<void>
+}
+
+export interface BuilderOptions {
+  /**
+   * Whether to share the config instance among environments to align with the behavior of dev server.
+   *
+   * @default false
+   * @experimental
+   */
+  sharedConfigBuild?: boolean
+  /**
+   * Whether to share the plugin instances among environments to align with the behavior of dev server.
+   *
+   * @default false
+   * @experimental
+   */
+  sharedPlugins?: boolean
+  buildApp?: (builder: ViteBuilder) => Promise<void>
+}
+
+const _builderOptionsDefaults = Object.freeze({
+  sharedConfigBuild: false,
+  sharedPlugins: false,
+  // buildApp
+} satisfies BuilderOptions)
+export const builderOptionsDefaults: Readonly<Partial<BuilderOptions>> =
+  _builderOptionsDefaults
+
+export function resolveBuilderOptions(
+  options: BuilderOptions | undefined,
+): ResolvedBuilderOptions | undefined {
+  if (!options) return
+  return mergeWithDefaults(
+    { ..._builderOptionsDefaults, buildApp: async () => {} },
+    options,
+  )
+}
+
+export type ResolvedBuilderOptions = Required<BuilderOptions>
+
+/**
+ * Creates a ViteBuilder to orchestrate building multiple environments.
+ * @experimental
+ */
+/**
+ * 作用：创建 Builder —— 多环境构建的编排器（build() 与 cli 的 build 命令都建立在它之上）。
+ * 调用点：本文件 build()（useLegacyBuilder=true）、cli.ts 的 build 命令（null，按 config.builder 决定）。
+ * 关键参数：useLegacyBuilder 为 true 时只建一个环境；sharedConfigBuild/sharedPlugins 控制多环境是否复用配置与插件实例。
+ * 失败模式：配置解析失败抛错；环境未在 config.environments 定义时 BuildEnvironment 构造函数抛错。
+ */
+export async function createBuilder(
+  inlineConfig: InlineConfig = {},
+  useLegacyBuilder: null | boolean = false,
+): Promise<ViteBuilder> {
+  const patchConfig = (resolved: ResolvedConfig) => {
+    // legacy 模式（或用户没配 builder）时，把「当前环境」的 build 选项覆盖到顶层 config.build 上，
+    // 让还只读 config.build 的旧插件/框架代码看到正确的值。
+    if (!(useLegacyBuilder ?? !resolved.builder)) return
+
+    // Until the ecosystem updates to use `environment.config.build` instead of `config.build`,
+    // we need to make override `config.build` for the current environment.
+    // We can deprecate `config.build` in ResolvedConfig and push everyone to upgrade, and later
+    // remove the default values that shouldn't be used at all once the config is resolved
+    const environmentName = resolved.build.ssr ? 'ssr' : 'client'
+    ;(resolved.build as ResolvedBuildOptions) = {
+      ...resolved.environments[environmentName].build,
+    }
+  }
+  const config = await resolveConfigToBuild(inlineConfig, patchConfig)
+  // 未显式指定时以「是否配置了 builder」为界：配置了就走多环境 Builder，否则退回单环境 legacy 路径。
+  useLegacyBuilder ??= !config.builder
+  const configBuilder = config.builder ?? resolveBuilderOptions({})!
+
+  const environments: Record<string, BuildEnvironment> = {}
+
+  const builder: ViteBuilder = {
+    environments,
+    config,
+    async buildApp() {
+      // buildApp 是所有环境的总调度点：插件 buildApp hook（pre/normal）→ config.builder.buildApp → post hook。
+      const pluginContext = new BasicMinimalPluginContext(
+        { ...basePluginContextMeta, watchMode: false },
+        config.logger,
+      )
+
+      // order 'pre' and 'normal' hooks are run first, then config.builder.buildApp, then 'post' hooks
+      let configBuilderBuildAppCalled = false
+      for (const p of config.getSortedPlugins('buildApp')) {
+        const hook = p.buildApp
+        // 遇到第一个 order:'post' 的 buildApp hook 时，先把 config.builder.buildApp 插进去；
+        // 这样配置里的 buildApp 恰好位于 pre/normal 与 post 之间，只插入一次（由 flag 保证）。
+        if (
+          !configBuilderBuildAppCalled &&
+          typeof hook === 'object' &&
+          hook.order === 'post'
+        ) {
+          configBuilderBuildAppCalled = true
+          await configBuilder.buildApp(builder)
+        }
+        const handler = getHookHandler(hook)
+        await handler.call(pluginContext, builder)
+      }
+      if (!configBuilderBuildAppCalled) {
+        await configBuilder.buildApp(builder)
+      }
+      // fallback to building all environments if no environments have been built
+      // 如果插件/配置的 buildApp 没有显式构建任何环境，这里按顺序把所有环境都构建一遍（client → ssr 等）。
+      if (
+        Object.values(builder.environments).every(
+          (environment) => !environment.isBuilt,
+        )
+      ) {
+        for (const environment of Object.values(builder.environments)) {
+          await builder.build(environment)
+        }
+      }
+    },
+    async build(
+      environment: BuildEnvironment,
+    ): Promise<RolldownOutput | RolldownOutput[] | RolldownWatcher> {
+      // 真正的打包入口；isBuilt 置位供 buildApp 的兜底逻辑判断「是否已被显式构建」。
+      const output = await buildEnvironment(environment)
+      environment.isBuilt = true
+      return output
+    },
+    async runDevTools() {
+      if (config.devtools) {
+        try {
+          const { runDevTools } = await import('@vitejs/devtools/integration')
+          await runDevTools(builder)
+        } catch (e) {
+          config.logger.error(
+            colors.red(
+              `Failed to run Vite DevTools: ${e?.message || e?.stack}`,
+            ),
+            { error: e },
+          )
+        }
+      }
+    },
+  }
+
+  async function setupEnvironment(name: string, config: ResolvedConfig) {
+    // createEnvironment 默认是 new BuildEnvironment(name, config)（见 resolveBuildEnvironmentOptions 的默认值），
+    // 框架可以覆盖它注入自定义环境类；init() 之后环境才可被 build。
+    const environment = await config.build.createEnvironment(name, config)
+    await environment.init()
+    environments[name] = environment
+  }
+
+  if (useLegacyBuilder) {
+    // legacy：只建一个环境，且直接复用第一次解析出的 config（插件实例也只有一份）。
+    await setupEnvironment(config.build.ssr ? 'ssr' : 'client', config)
+  } else {
+    const environmentConfigs: [string, ResolvedConfig][] = []
+    for (const environmentName of Object.keys(config.environments)) {
+      // We need to resolve the config again so we can properly merge options
+      // and get a new set of plugins for each build environment. The ecosystem
+      // expects plugins to be run for the same environment once they are created
+      // and to process a single bundle at a time (contrary to dev mode where
+      // plugins are built to handle multiple environments concurrently).
+      let environmentConfig = config
+      if (!configBuilder.sharedConfigBuild) {
+        const patchConfig = (resolved: ResolvedConfig) => {
+          // Until the ecosystem updates to use `environment.config.build` instead of `config.build`,
+          // we need to make override `config.build` for the current environment.
+          // We can deprecate `config.build` in ResolvedConfig and push everyone to upgrade, and later
+          // remove the default values that shouldn't be used at all once the config is resolved
+          ;(resolved.build as ResolvedBuildOptions) = {
+            ...resolved.environments[environmentName].build,
+          }
+        }
+        const patchPlugins = (resolvedPlugins: Plugin[]) => {
+          // Force opt-in shared plugins
+          // 跨环境复用插件实例：按名字在顶层 config.plugins 里找同源实例替换进去（j 游标保证不重复匹配）。
+          let j = 0
+          for (let i = 0; i < resolvedPlugins.length; i++) {
+            const environmentPlugin = resolvedPlugins[i]
+            if (
+              configBuilder.sharedPlugins ||
+              environmentPlugin.sharedDuringBuild
+            ) {
+              for (let k = j; k < config.plugins.length; k++) {
+                if (environmentPlugin.name === config.plugins[k].name) {
+                  resolvedPlugins[i] = config.plugins[k]
+                  j = k + 1
+                  break
+                }
+              }
+            }
+          }
+        }
+        environmentConfig = await resolveConfigToBuild(
+          inlineConfig,
+          patchConfig,
+          patchPlugins,
+        )
+      }
+      // 多环境各自持有独立 config/插件实例，因此可以并行 setup（每个环境只处理自己的 bundle）。
+      environmentConfigs.push([environmentName, environmentConfig])
+    }
+    await Promise.all(
+      environmentConfigs.map(
+        async ([environmentName, environmentConfig]) =>
+          await setupEnvironment(environmentName, environmentConfig),
+      ),
+    )
+  }
+
+  return builder
+}
+
+export type BuildAppHook = (
+  this: MinimalPluginContextWithoutEnvironment,
+  builder: ViteBuilder,
+) => Promise<void>
